@@ -6,7 +6,7 @@ import signal
 import threading
 import time
 from collections import defaultdict, deque
-from collections.abc import Callable, Generator
+from collections.abc import Callable, Generator, Mapping
 from concurrent.futures import Future
 from contextlib import ExitStack, contextmanager
 from inspect import isclass, signature
@@ -1392,10 +1392,20 @@ class EngineCoreProc(EngineCore):
             return True
 
         if mode == "abort":
+            # Collect trace_headers and num_cached_tokens from requests
+            # before finish_requests() frees them, so that abort outputs
+            # carry proper metrics and tracing data.
+            request_metadata: dict[str, tuple[Mapping[str, str] | None, int]] = {}
+            for req_id, req in self.scheduler.requests.items():
+                if not req.is_finished():
+                    request_metadata[req_id] = (
+                        req.trace_headers,
+                        max(req.num_cached_tokens, 0),
+                    )
             aborted_reqs = self.scheduler.finish_requests(
                 None, RequestStatus.FINISHED_ABORTED
             )
-            self._send_abort_outputs(aborted_reqs)
+            self._send_abort_outputs(aborted_reqs, request_metadata)
 
         pause_state = PauseState.PAUSED_ALL if mode == "keep" else PauseState.PAUSED_NEW
         self.scheduler.set_pause_state(pause_state)
@@ -1404,17 +1414,33 @@ class EngineCoreProc(EngineCore):
             return future
         return None
 
-    def _send_abort_outputs(self, aborted_reqs: list[tuple[str, int]]) -> None:
+    def _send_abort_outputs(
+        self,
+        aborted_reqs: list[tuple[str, int]],
+        request_metadata: dict[str, tuple[Mapping[str, str] | None, int]] | None = None,
+    ) -> None:
         if aborted_reqs:
             # Map client_index to list of request_ids that belong to that client.
             by_client = defaultdict[int, set[str]](set)
             for req_id, client_index in aborted_reqs:
                 by_client[client_index].add(req_id)
             for client_index, req_ids in by_client.items():
-                outputs = [
-                    EngineCoreOutput(req_id, [], finish_reason=FinishReason.ABORT)
-                    for req_id in req_ids
-                ]
+                outputs = []
+                for req_id in req_ids:
+                    trace_headers, num_cached_tokens = (
+                        request_metadata.get(req_id, (None, 0))
+                        if request_metadata
+                        else (None, 0)
+                    )
+                    outputs.append(
+                        EngineCoreOutput(
+                            req_id,
+                            [],
+                            finish_reason=FinishReason.ABORT,
+                            trace_headers=trace_headers,
+                            num_cached_tokens=num_cached_tokens,
+                        )
+                    )
                 eco = EngineCoreOutputs(finished_requests=req_ids, outputs=outputs)
                 self.output_queue.put_nowait((client_index, eco))
 
